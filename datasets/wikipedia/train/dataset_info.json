@@ -1,0 +1,42 @@
+{
+  "builder_name": "json",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "wikipedia-cn-20230720-filtered",
+  "dataset_size": 510851905,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/pleisto/wikipedia-cn-20230720-filtered@4cef256a3f426ae1d3f6930c8cd59a32d785d99d/wikipedia-cn-20230720-filtered.json": {
+      "num_bytes": 524489333,
+      "checksum": null
+    }
+  },
+  "download_size": 524489333,
+  "features": {
+    "completion": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "source": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 1035341238,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 510851905,
+      "num_examples": 254547,
+      "dataset_name": "wikipedia-cn-20230720-filtered"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}
