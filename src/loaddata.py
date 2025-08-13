@@ -20,8 +20,9 @@ def load_local_data():
     
     return completion_list
 
-
-
+# %%
+load_local_data()
+print('load data')
 
 # %% [markdown]
 # ### load  txt of en
@@ -29,7 +30,7 @@ def load_local_data():
 # %%
 # en txt for debug
 
-def     load_data_en(file_path,train_ratio=0.8):
+def load_data_en(file_path,train_ratio=0.8):
     with open (file_path,"r",encoding="utf-8") as file:
         text_data =file.read()
         

@@ -1,5 +1,5 @@
 # %% [markdown]
-# # GPT Model
+# #  Model Wrapper
 # 
 
 # %%
@@ -18,7 +18,6 @@ from tqdm import tqdm
 # %%
 IS_SKIP_TEST =True
 
-
 GPT_CONFIG = {
     "num_epochs":10,
     "batch_size":4,
@@ -32,7 +31,7 @@ GPT_CONFIG = {
 }
 
 TOKEN_TYPE="gpt2"
-# TOKEN_TYPE="cl100k_base"
+
 
 # %% [markdown]
 # ### Set device to (type='cuda')
@@ -61,26 +60,29 @@ class DummyLayerNorm(nn.Module):
 class DummyGPT(nn.Module):
     def __init__(self,cfg):
         super().__init__()
-        self.tok_emb = nn.Embedding(cfg['vocab_size'],cfg['emb_dim'])
-        self.pos_emb = nn.Embedding(cfg['context_len'],cfg['emb_dim'])
+        self.tok_emb = nn.Embedding(cfg['vocab_size'],cfg['emb_dim']) #  “字典表”  (vocab_size, emb_dim) vocab_size 行，每一行对应一个 token 的emb_dim维的向量 
+        self.pos_emb = nn.Embedding(cfg['context_len'],cfg['emb_dim']) # (context_len, emb_dim)
         self.drop_emb = nn.Dropout(cfg["drop_rate"])
         self.trf_blocks =  nn.Sequential(
             *[DummyTransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
         self.final_norm = DummyLayerNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(
-            cfg['emb_dim'],cfg['vocab_size'],bias=False
-        )
+            cfg['emb_dim'],cfg['vocab_size'],bias=False 
+        )# y = x · W^T + b   W的形状为[vocab_size,emb_dim] 本质是计算x与W的相似度 ，得到vocab_size个y向量
        
     def forward(self,in_idx):
-        batch_size, seq_len = in_idx.shape  #in_idx 通常是一个整数张量（Tensor），形状一般为 (batch_size, seq_len)
-        tok_embeds = self.tok_emb(in_idx) #(batch_size, seq_len, emb_dim)
-        pos_embeds = self.pos_emb(torch.arange(seq_len,device=in_idx.device))  #生成一个从 0 到 seq_len-1 的整数序列
-        x = tok_embeds + pos_embeds
+        #in_idx 通常是一个整数张量（Tensor），形状一般为 (batch_size, seq_len)
+        batch_size, seq_len = in_idx.shape  #in_idx 每个元素都是 token 的索引（范围是 [0, vocab_size-1])
+        tok_embeds = self.tok_emb(in_idx) #查“字典表”映射  嵌入向量(batch_size, seq_len)-->(batch_size, seq_len, emb_dim) 
+
+        pos_embeds = self.pos_emb(torch.arange(seq_len,device=in_idx.device))  #生成一个从 0 到 seq_len-1 的整数序列 (seq_len,) -->(seq_len, emb_dim)
+   
+        x = tok_embeds + pos_embeds #pos_embeds会自动广播为 -->(batch_size, seq_len, emb_dim)
         x = self.drop_emb(x)
         x = self.trf_blocks(x)
-        x = self.final_norm(x)
-        logits = self.out_head(x)
+        x = self.final_norm(x) #-->(batch_size, seq_len, emb_dim)
+        logits = self.out_head(x) #(batch_size, seq_len, emb_dim)-->(batch_size, seq_len, vocab_size)
         return logits
         
         
@@ -346,7 +348,17 @@ def text_to_tokenIds(text,tokenizer):
 def tokenIds_to_text(token_ids,tokenizer):
     flat =token_ids.squeeze(0)
     return tokenizer.decode(flat.tolist())
-#max_new_tokens 生成往后n个token
+
+
+# %% [markdown]
+# ## Generate text
+# 
+# max_new_tokens: 往后生成n个token
+# 
+# context_size: 更关注最近的上下文，只取size数量的token
+
+# %%
+
 def  generate_text_greedy(model,idxs,max_new_tokens,context_size):
     model.eval()
     for _ in range(max_new_tokens):
@@ -361,9 +373,34 @@ def  generate_text_greedy(model,idxs,max_new_tokens,context_size):
         idxs = torch.cat((idxs,idx_next),dim=1)
     return idxs
 
+def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
+                              temperture=0.0,top_k=None,eos_id=None):
+    model.eval()
+    for _ in range(max_new_tokens):
+        idx_condition = idxs[:,-context_size:]
+        
+        with torch.no_grad():
+            logits = model(idx_condition)
+        logits = logits[:,-1,:]
+        
+        if top_k is not None:
+            top_logits,_ = torch.topk(logits,top_k)
+            min_val = top_logits[:,-1]
+            logits = torch.where(logits<min_val,torch.tensor(float('-inf')).to(logits.device),logits)
+            
+        if temperture > 0:
+            probas =torch.softmax(logits/temperture,dim=-1)
+            idx_next = torch.multinomial(probas,num_samples=1) # 高温度下，概率分布平缓，采样会更大概率选中次优选项
+        else:
+            probas =torch.softmax(logits,dim=-1)
+            idx_next = torch.argmax(probas,dim=-1,keepdim=True)# greedy 
+        if idx_next == eos_id:
+            break
+        idxs = torch.cat((idxs,idx_next),dim=1)
+    return idxs
 
 # %% [markdown]
-# ### test tokenizer
+# ### test gernerate
 
 # %%
 @tool.skip_execution(skip=IS_SKIP_TEST)
@@ -377,9 +414,14 @@ def test_tokenizer():
     print(f'{tokenIds_to_text(tokenids,tokenizer)}--recover') 
 
 
-    tokenids = generate_text_greedy(model,tokenids,max_new_tokens=3,context_size=GPT_CONFIG['context_len'])
+    tokenids_g = generate_text_greedy(model,tokenids,max_new_tokens=10,context_size=GPT_CONFIG['context_len'])
 
-    print(f'{tokenIds_to_text(tokenids,tokenizer)}--new') 
+    print(f'{tokenIds_to_text(tokenids_g,tokenizer)}--greedy') 
+    
+    tokenids_s = generate_text_withsample(model,tokenids,max_new_tokens=10,context_size=GPT_CONFIG['context_len'],
+                                        temperture=0.5,top_k=50,eos_id=None)
+
+    print(f'{tokenIds_to_text(tokenids_s,tokenizer)}--sample') 
 
 test_tokenizer()
 
@@ -394,12 +436,12 @@ test_tokenizer()
 
 # %%
 
-def generate_and_print(model,tokenizer,device,start_context,max_new_tokens):
+def generate_and_print(model,tokenizer,device,start_context,max_new_tokens, temperture=0,top_k=None,eos_id=None):
     model.eval()
     context_size = model.pos_emb.weight.shape[0]
     encoded = text_to_tokenIds(start_context,tokenizer).to(device)
     with torch.no_grad():
-        token_ids = generate_text_greedy(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size)
+        token_ids = generate_text_withsample(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size, temperture=temperture,top_k=top_k,eos_id=eos_id)
         decoded_text = tokenIds_to_text(token_ids,tokenizer)
     print(decoded_text.replace("\n"," "))
     model.train()
@@ -488,7 +530,7 @@ def GPTDataloader(txts:list[str],token_type,batch_size=4,max_len=246,stride=128,
 def calc_loss_batch(input_batch,target_batch,model,device):
     input_batch = input_batch.to(device)
     target_batch = target_batch.to(device)
-    logits = model(input_batch)
+    logits = model(input_batch) # 隐式调用 model.forward(input_batch)
     loss =torch.nn.functional.cross_entropy(logits.flatten(0,1),target_batch.flatten())
     return loss
 
