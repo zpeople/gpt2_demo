@@ -3,12 +3,31 @@
 # 
 
 # %%
+import sys
+import os
+
+# 检查是否在Jupyter环境中
+try:
+    # 如果是Jupyter，会定义这个变量
+    get_ipython
+    # 使用当前工作目录作为基准（Jupyter的工作目录）
+    current_dir = os.getcwd()
+except NameError:
+    # 普通Python环境，使用__file__
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 将父目录添加到Python路径（根据你的目录结构调整）
+parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
+if parent_dir not in sys.path:
+    sys.path.append(parent_dir)
+    
+
 
 import torch
 import torch.nn as nn
 from torch.testing import assert_close
 torch.manual_seed(42)
-import tool
+from src import tool
 from tqdm import tqdm
 
 
@@ -374,7 +393,7 @@ def  generate_text_greedy(model,idxs,max_new_tokens,context_size):
     return idxs
 
 def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
-                              temperture=0.0,top_k=None,eos_id=None):
+                              temperature=0.0,top_k=None,top_p=1,eos_id=None):
     model.eval()
     for _ in range(max_new_tokens):
         idx_condition = idxs[:,-context_size:]
@@ -382,20 +401,42 @@ def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
         with torch.no_grad():
             logits = model(idx_condition)
         logits = logits[:,-1,:]
-        
+        # region top k
         if top_k is not None:
             top_logits,_ = torch.topk(logits,top_k)
             min_val = top_logits[:,-1]
             logits = torch.where(logits<min_val,torch.tensor(float('-inf')).to(logits.device),logits)
+        # endregion
+        
+        # region top p
+        if top_p >0 and top_p<1: # top_p ==1 continue
+            sorted_logits, sorted_idx =torch.sort(logits,dim = -1,descending = True)
+            sorted_probs = torch.softmax(sorted_logits,dim = -1)
+            cumulative_probs = torch.cumsum(sorted_probs,dim= -1)
             
-        if temperture > 0:
-            probas =torch.softmax(logits/temperture,dim=-1)
+            mask = cumulative_probs>top_p
+            mask = mask.scatter(-1, torch.argmax(mask, dim=-1, keepdim=True), False)
+            sorted_logits[mask] = -torch.inf
+            _, original_indices = torch.sort(sorted_idx, dim=-1)
+            logits = torch.gather(sorted_logits, dim=-1, index=original_indices)
+        elif top_p != 1.0:
+            raise ValueError(f"top_p must be in [0, 1], got {top_p}")
+        # endregion
+        
+        # region temperature
+        if temperature > 0:
+            probas =torch.softmax(logits/temperature,dim=-1)
             idx_next = torch.multinomial(probas,num_samples=1) # 高温度下，概率分布平缓，采样会更大概率选中次优选项
         else:
             probas =torch.softmax(logits,dim=-1)
             idx_next = torch.argmax(probas,dim=-1,keepdim=True)# greedy 
-        if idx_next == eos_id:
-            break
+            
+        if eos_id is not None:
+            # 若batch中任何一个样本生成eos_id，终止该样本（这里简化为单样本处理）
+            if torch.any(idx_next == eos_id):
+                break  
+        
+        # endregion
         idxs = torch.cat((idxs,idx_next),dim=1)
     return idxs
 
@@ -419,7 +460,7 @@ def test_tokenizer():
     print(f'{tokenIds_to_text(tokenids_g,tokenizer)}--greedy') 
     
     tokenids_s = generate_text_withsample(model,tokenids,max_new_tokens=10,context_size=GPT_CONFIG['context_len'],
-                                        temperture=0.5,top_k=50,eos_id=None)
+                                        temperature=0.5,top_k=50,top_p=1,eos_id=None)
 
     print(f'{tokenIds_to_text(tokenids_s,tokenizer)}--sample') 
 
@@ -436,12 +477,12 @@ test_tokenizer()
 
 # %%
 
-def generate_and_print(model,tokenizer,device,start_context,max_new_tokens, temperture=0,top_k=None,eos_id=None):
+def generate_and_print(model,tokenizer,device,start_context,max_new_tokens, temperature=0,top_k=None,top_p=1,eos_id=None):
     model.eval()
     context_size = model.pos_emb.weight.shape[0]
     encoded = text_to_tokenIds(start_context,tokenizer).to(device)
     with torch.no_grad():
-        token_ids = generate_text_withsample(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size, temperture=temperture,top_k=top_k,eos_id=eos_id)
+        token_ids = generate_text_withsample(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size, temperature=temperature,top_k=top_k,top_p=top_p,eos_id=eos_id)
         decoded_text = tokenIds_to_text(token_ids,tokenizer)
     print(decoded_text.replace("\n"," "))
     model.train()
@@ -597,12 +638,20 @@ test_loss()
 # ### Save model
 
 # %%
-def savemodel(path,model,optimizer):
+def savemodel(path,model,optimizer,config):
+    
+    if False: # view model 
+        for name, param in model.state_dict().items():
+            print(f"{name}: {param.shape}")
+            
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "config":config
         },
         path
     )
+
+
 
 
