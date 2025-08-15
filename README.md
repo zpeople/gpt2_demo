@@ -42,7 +42,9 @@
   
     (如果d_out=d_model,参数量爆炸，可设置d_out=d_model/num_heads)
   * MultiHeadAttendtion_new : 参数量num_heads×d_model×head_dim, head_dim=d_model/num_head同上的d_out,比上优点只执行一次矩阵乘法 
-  ![att diff](.\img\att.png)
+    
+    ![att diff](./img/attn.png)
+
 * **Transformer block**:
   * 注意力分支：LayerNorm1 -> Attn -> Dropout -> 残差连接
   *  FFN分支：LayerNorm2 -> FFN -> Dropout -> 残差连接
@@ -67,4 +69,4 @@ load_openai_weights：手动匹配各层的state_dict
 interactive_generate.py
 
 命令行输入prompt测试模型生成能力
-![alt text](image.png)
+![alt text](./img/interactive.png)
