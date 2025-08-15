@@ -661,4 +661,50 @@ def savemodel(path,model,optimizer,config):
 
 
 
+# %%
+
+
+def save_checkpoint(model, optimizer, epoch, global_step, train_losses, val_losses, track_tokens_seen, save_path):
+    """保存训练状态用于后续恢复"""
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,  # 当前训练到的 epoch（下一次应从该 epoch 继续）
+        'global_step': global_step,
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'track_tokens_seen': track_tokens_seen,
+        'torch_rng_state': torch.get_rng_state(),  # 保存随机数状态
+        'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    }
+    # 创建保存目录（如果不存在）
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(checkpoint, save_path)
+    print(f"Checkpoint saved to {save_path}")
+    
+def load_checkpoint(model, optimizer, load_path):
+    """加载训练状态，返回恢复后的训练进度信息"""
+    if not os.path.exists(load_path):
+        raise FileNotFoundError(f"Checkpoint {load_path} not found")
+    
+    checkpoint = torch.load(load_path)
+    
+    # 恢复模型参数
+    model.load_state_dict(checkpoint['model_state_dict'])
+    # 恢复优化器参数（重要，确保学习率、动量等状态正确）
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    # 恢复随机数状态（保证复现性）
+    torch.set_rng_state(checkpoint['torch_rng_state'])
+    if torch.cuda.is_available() and checkpoint['cuda_rng_state'] is not None:
+        torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
+    
+    # 返回训练进度信息
+    return {
+        'epoch': checkpoint['epoch'],
+        'global_step': checkpoint['global_step'],
+        'train_losses': checkpoint['train_losses'],
+        'val_losses': checkpoint['val_losses'],
+        'track_tokens_seen': checkpoint['track_tokens_seen']
+    }
+
 
