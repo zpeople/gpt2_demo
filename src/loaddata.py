@@ -21,8 +21,8 @@ def load_local_data():
     return completion_list
 
 # %%
+print('load local data:')
 load_local_data()
-print('load data')
 
 # %% [markdown]
 # ### load  txt of en

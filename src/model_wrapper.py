@@ -6,17 +6,14 @@
 import sys
 import os
 
-# 检查是否在Jupyter环境中
+
 try:
-    # 如果是Jupyter，会定义这个变量
     get_ipython
-    # 使用当前工作目录作为基准（Jupyter的工作目录）
     current_dir = os.getcwd()
 except NameError:
-    # 普通Python环境，使用__file__
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
-# 将父目录添加到Python路径（根据你的目录结构调整）
+# Set path，temporary path expansion
 parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
@@ -37,7 +34,7 @@ from tqdm import tqdm
 # %%
 IS_SKIP_TEST =True
 
-GPT_CONFIG = {
+TEST_CONFIG = {
     "num_epochs":10,
     "batch_size":4,
     "vocab_size": 50257,     # 词汇表大小
@@ -58,6 +55,9 @@ TOKEN_TYPE="gpt2"
 # %%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device
+
+# %% [markdown]
+# ## Define Test Model
 
 # %%
 
@@ -109,13 +109,13 @@ class DummyGPT(nn.Module):
 # %%
 @tool.skip_execution(skip=IS_SKIP_TEST)
 def test_dummyModel():
-    model = DummyGPT(GPT_CONFIG)
+    model = DummyGPT(TEST_CONFIG)
     return model
 
 test_dummyModel()
 
 # %% [markdown]
-# ## Define layerNorm
+# ## Define LayerNorm
 
 # %%
 class LayerNorm(nn.Module):
@@ -165,8 +165,9 @@ def test_layer_norm():
 test_layer_norm()
 
 # %% [markdown]
-# ## Define activate function
+# ## Define Activation Function
 # 
+# 高斯误差线性单元 GELU
 # Φ(x) ≈ 0.5 * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
 
 # %%
@@ -276,7 +277,7 @@ class MultiHeadAttendtion(nn.Module):
 # %%
 # TODO 更高效的MutiAttention 减少计算量
 
-#参数规模更小（d_model×d_model 对比 num_heads×d_model×head_dim)
+#参数规模更小（num_heads×d_model×d_model 对比 num_heads×d_model×head_dim)
 class MultiHeadAttendtion_new(nn.Module):
     def __init__(self, d_in, d_out,context_len,dropout,num_heads,qkv_bias=False):
         super().__init__()
@@ -325,6 +326,7 @@ class MultiHeadAttendtion_new(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        self.norm1 = LayerNorm(cfg['emb_dim']) #norm1：用于注意力模块（self.att）的输入归一化
         self.att = MultiHeadAttendtion_new(
             d_in= cfg["emb_dim"],
             d_out= cfg['emb_dim'],
@@ -333,14 +335,13 @@ class TransformerBlock(nn.Module):
             dropout= cfg["drop_rate"],
             qkv_bias=cfg["qkv_bias"]
         )
-        self.ff =FeedForward(cfg)
-        self.norm1 = LayerNorm(cfg['emb_dim']) #norm1：用于注意力模块（self.att）的输入归一化
         self.norm2 = LayerNorm(cfg['emb_dim']) #norm2：用于前馈网络（self.ff）的输入归一化
+        self.ff =FeedForward(cfg)
         self.dropout = nn.Dropout(cfg['drop_rate'])
         
     
     def forward(self,x):
-       # 注意力分支：LayerNorm -> 注意力 -> Dropout -> 残差连接
+        # 注意力分支：LayerNorm -> 注意力 -> Dropout -> 残差连接
         x = x + self.dropout(self.att(self.norm1(x))) 
         # FFN分支：LayerNorm -> FFN -> Dropout -> 残差连接
         x = x + self.dropout(self.ff(self.norm2(x)))  
@@ -415,7 +416,8 @@ def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
             cumulative_probs = torch.cumsum(sorted_probs,dim= -1)
             
             mask = cumulative_probs>top_p
-            mask = mask.scatter(-1, torch.argmax(mask, dim=-1, keepdim=True), False)
+            max_mask_idx = torch.argmax(mask.float(), dim=-1, keepdim=True)
+            mask = mask.scatter(-1, max_mask_idx, False)
             sorted_logits[mask] = -torch.inf
             _, original_indices = torch.sort(sorted_idx, dim=-1)
             logits = torch.gather(sorted_logits, dim=-1, index=original_indices)
@@ -446,7 +448,7 @@ def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
 # %%
 @tool.skip_execution(skip=IS_SKIP_TEST)
 def test_tokenizer():
-    model =DummyGPT(GPT_CONFIG)
+    model =DummyGPT(TEST_CONFIG)
     test_context ="今天的天气是晴天，适合出去走走"
     #test_context = "I like the weather"
     print(f'{test_context}--ori')
@@ -455,11 +457,11 @@ def test_tokenizer():
     print(f'{tokenIds_to_text(tokenids,tokenizer)}--recover') 
 
 
-    tokenids_g = generate_text_greedy(model,tokenids,max_new_tokens=10,context_size=GPT_CONFIG['context_len'])
+    tokenids_g = generate_text_greedy(model,tokenids,max_new_tokens=10,context_size=TEST_CONFIG['context_len'])
 
     print(f'{tokenIds_to_text(tokenids_g,tokenizer)}--greedy') 
     
-    tokenids_s = generate_text_withsample(model,tokenids,max_new_tokens=10,context_size=GPT_CONFIG['context_len'],
+    tokenids_s = generate_text_withsample(model,tokenids,max_new_tokens=10,context_size=TEST_CONFIG['context_len'],
                                         temperature=0.5,top_k=50,top_p=1,eos_id=None)
 
     print(f'{tokenIds_to_text(tokenids_s,tokenizer)}--sample') 
@@ -609,7 +611,7 @@ def evaluate_model(model,train_loader,valid_loader,device,eval_iter):
 # %%
 @tool.skip_execution(skip=IS_SKIP_TEST)
 def test_loss():
-    model = DummyGPT(GPT_CONFIG)
+    model = DummyGPT(TEST_CONFIG)
     model.to(device)
     file_path ="../datasets/the-verdict.txt"
     with open (file_path,"r",encoding="utf-8") as file:
@@ -622,9 +624,9 @@ def test_loss():
     train_loader = GPTDataloader(
         [train_data],
         TOKEN_TYPE,
-        batch_size = GPT_CONFIG['batch_size'],
-        max_len = GPT_CONFIG["context_len"],
-        stride = GPT_CONFIG["context_len"] // 2, 
+        batch_size = TEST_CONFIG['batch_size'],
+        max_len = TEST_CONFIG["context_len"],
+        stride = TEST_CONFIG["context_len"] // 2, 
         drop_last=True,
         shuffle= True, 
         num_works=0   
@@ -643,14 +645,19 @@ def savemodel(path,model,optimizer,config):
     if False: # view model 
         for name, param in model.state_dict().items():
             print(f"{name}: {param.shape}")
-            
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config":config
-        },
-        path
-    )
+    
+    save_data = {"model_state_dict": model.state_dict()}
+    
+    if optimizer is not None:
+        save_data["optimizer_state_dict"] = optimizer.state_dict()
+    
+    if config is not None:
+        save_data["config"] = config
+    try:
+        torch.save(save_data, path)
+    except Exception as e:
+        raise IOError(f"save model fail: {e}") from e
+    
 
 
 

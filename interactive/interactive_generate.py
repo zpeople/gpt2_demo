@@ -1,33 +1,24 @@
 import sys
 import os
-
-
-# 检查是否在Jupyter环境中
 try:
-    # 如果是Jupyter，会定义这个变量
     get_ipython
-    # 使用当前工作目录作为基准（Jupyter的工作目录）
     current_dir = os.getcwd()
 except NameError:
-    # 普通Python环境，使用__file__
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
-# 将父目录添加到Python路径（根据你的目录结构调整）
+# Set path，temporary path expansion
 parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
     
-
-
-
-
 import fire 
 import json
 from src import model_wrapper,models
 import torch
 import tiktoken
 
-# python -m interactive.interactive_generate  gpt2.pt gpt2 --max_new_tokens 100 --temperature 0.7 --top_k 50  --eos_id 50256 --models_dir "./model/" 
+
+
 
 
 
@@ -66,3 +57,5 @@ def interact_model(
 if __name__ == '__main__':
     fire.Fire(interact_model)
 
+# 执行代码
+# python -m interactive.interactive_generate  gpt2_weight.pt gpt2 --max_new_tokens 50 --temperature 0.7 --top_k 50  --eos_id 50256 --models_dir "./model/" 

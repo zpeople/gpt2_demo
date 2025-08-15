@@ -3,21 +3,17 @@
 # 
 
 # %%
-
 import sys
 import os
 
-# 检查是否在Jupyter环境中
+
 try:
-    # 如果是Jupyter，会定义这个变量
     get_ipython
-    # 使用当前工作目录作为基准（Jupyter的工作目录）
     current_dir = os.getcwd()
 except NameError:
-    # 普通Python环境，使用__file__
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
-# 将父目录添加到Python路径（根据你的目录结构调整）
+# Set path，temporary path expansion
 parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
@@ -26,33 +22,11 @@ import torch
 import torch.nn as nn 
 from src import tool ,model_wrapper
 
-
-
 # %% [markdown]
 # ### Config
 
 # %%
 IS_SKIP_TEST =True
-
-GPT_CONFIG = {
-    "num_epochs":10,
-    "batch_size":4,
-    "vocab_size": 50257,     # 词汇表大小
-    "context_len": 256,  # 上下文长度
-    "emb_dim": 768,          # 嵌入维度
-    "n_heads": 8,           # 注意力头的数量
-    "n_layers": 12,          # 层数
-    "drop_rate": 0.1,        # dropout率
-    "qkv_bias": False ,      # 查询-键-值偏置
-}
-
-
-# %% [markdown]
-# ### Set device to (type='cuda')
-
-# %%
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device
 
 # %% [markdown]
 # ## Define GPT-2 Model
@@ -103,9 +77,9 @@ def test_GPT2_model():
     "qkv_bias": False ,      
     }   
     model = GPTModel(CONFIG)
-    model.to(device)
+ 
 
-    # attention_new 参数减少量 = (304,556,544 - 163,008,000)
+    # multi attention_new 参数减少量 = (304,556,544 - 163,008,000)
     total_params =sum(p.numel() for p in model.parameters())
 
     print(f"Total number of parameters: {total_params:,}") #163,008,000
