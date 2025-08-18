@@ -58,4 +58,8 @@ if __name__ == '__main__':
     fire.Fire(interact_model)
 
 # 执行代码
-# python -m interactive.interactive_generate  gpt2_weight.pt gpt2 --max_new_tokens 50 --temperature 0.7 --top_k 50  --eos_id 50256 --models_dir "./model/" 
+# en：
+# python -m interactive.interactive_generate  gpt2_weight.pt gpt2 --max_new_tokens 200 --temperature 0.7 --top_k 50  --eos_id 50256 --models_dir "./model/" 
+
+# cn：
+# python -m interactive.interactive_generate  cn/gpt2.pt cl100k_base --max_new_tokens 200 --temperature 1.5 --top_k 50  --eos_id None --models_dir "./model/" 

@@ -35,6 +35,7 @@ IS_SKIP_TEST =True
 class GPTModel(nn.Module):
     def __init__(self,cfg):
         super().__init__()
+        self.initializer_range =0.02
         self.tok_emb = nn.Embedding(cfg['vocab_size'],cfg['emb_dim'])
         self.pos_emb = nn.Embedding(cfg['context_len'],cfg['emb_dim'])
         self.drop_emb = nn.Dropout(cfg["drop_rate"])
@@ -45,6 +46,7 @@ class GPTModel(nn.Module):
         self.out_head = nn.Linear(
             cfg['emb_dim'],cfg['vocab_size'],bias=False
         )
+        self.apply(self._init_weights)
        
     def forward(self,in_idx):
         batch_size, seq_len = in_idx.shape  
@@ -56,7 +58,19 @@ class GPTModel(nn.Module):
         x = self.final_norm(x)
         logits = self.out_head(x)
         return logits
-        
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # 基础初始化：均值0，标准差initializer_range
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+    
+      
 
 # %% [markdown]
 # ### View structure of model 

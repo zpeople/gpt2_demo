@@ -26,12 +26,14 @@ from torch.testing import assert_close
 torch.manual_seed(42)
 from src import tool
 from tqdm import tqdm
+import math
 
 
 # %% [markdown]
 # ### Config
 
 # %%
+
 IS_SKIP_TEST =True
 
 TEST_CONFIG = {
@@ -43,6 +45,7 @@ TEST_CONFIG = {
     "n_heads": 8,           # 注意力头的数量
     "n_layers": 12,          # 层数
     "drop_rate": 0.1,        # dropout率
+    "initializer_range":0.02,
     "qkv_bias": False ,      # 查询-键-值偏置
 }
 
@@ -221,16 +224,23 @@ test_gelu()
 class FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.layers = nn.Sequential(
-            #中间层hidden_dim通常设为4*emb_dim（如原始 Transformer 中为 512→2048→512），通过扩展维度捕捉更丰富的特征
-            nn.Linear(cfg['emb_dim'],4*cfg['emb_dim']),  
-            GELU(),
-            nn.Dropout(cfg['drop_rate']),
-            nn.Linear(4*cfg['emb_dim'],cfg['emb_dim'])
+    
+        #中间层hidden_dim通常设为4*emb_dim（如原始 Transformer 中为 512→2048→512），通过扩展维度捕捉更丰富的特征
+        self.c_fc=nn.Linear(cfg['emb_dim'],4*cfg['emb_dim'])
+        self.act=   GELU()
+        self.dropout=   nn.Dropout(cfg['drop_rate'])
+        self.c_proj=  nn.Linear(4*cfg['emb_dim'],cfg['emb_dim'])
+        self.c_proj.weight.data.normal_(
+            mean=0.0, 
+            std=cfg['initializer_range'] / math.sqrt(2 * cfg['n_layers'])  # 层数相关的缩放
         )
         
     def forward(self,x):
-        return self.layers(x)
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 # %% [markdown]
 # ## Define MultiAttention
@@ -249,6 +259,7 @@ class CausalAttention(nn.Module):
             'mask', 
             torch.triu(torch.ones(context_len,context_len),diagonal=1)
         )
+        
     
     def forward(self,x):
         b,num_tokens,d_in = x.shape
@@ -279,7 +290,7 @@ class MultiHeadAttendtion(nn.Module):
 
 #参数规模更小（num_heads×d_model×d_model 对比 num_heads×d_model×head_dim)
 class MultiHeadAttendtion_new(nn.Module):
-    def __init__(self, d_in, d_out,context_len,dropout,num_heads,qkv_bias=False):
+    def __init__(self, d_in, d_out,context_len,dropout,num_heads,initializer_range,n_layer,qkv_bias=False):
         super().__init__()
         self.d_out =d_out
         self.num_heads = num_heads
@@ -287,11 +298,15 @@ class MultiHeadAttendtion_new(nn.Module):
         self.W_q = nn.Linear(d_in,d_out,bias= qkv_bias)
         self.W_k = nn.Linear(d_in,d_out,bias= qkv_bias)
         self.W_v = nn.Linear(d_in,d_out,bias= qkv_bias)
-        self.out_proj =nn.Linear(d_out,d_out) # out_proj 可以学习如何 “融合” 这些头的信息（例如对不同头的特征赋予不同权重），而不是简单保留原始拼接结果
+        self.c_proj =nn.Linear(d_out,d_out) # out_proj 可以学习如何 “融合” 这些头的信息（例如对不同头的特征赋予不同权重），而不是简单保留原始拼接结果
         self.dropout = nn.Dropout(dropout)
         self.register_buffer(
             'mask', 
             torch.triu(torch.ones(context_len,context_len),diagonal=1)
+        )
+        self.c_proj.weight.data.normal_(
+            mean=0.0, 
+            std=initializer_range / math.sqrt(2 *n_layer)  # 层数相关的缩放
         )
     
     def forward(self,x):
@@ -313,10 +328,11 @@ class MultiHeadAttendtion_new(nn.Module):
         att_score = queries @ keys.transpose(2,3)
         att_score.masked_fill_(self.mask.bool()[:num_tokens,:num_tokens],-torch.inf)
         att_weight = torch.softmax(att_score/keys.shape[-1]**0.5, dim=-1)
-        att_weight = self.dropout(att_weight)
+        # att_weight = self.dropout(att_weight)
         context_vec = (att_weight @ values).transpose(1,2)
         context_vec = context_vec.contiguous().view(b,num_tokens,self.d_out)
-        context_vec = self.out_proj(context_vec)
+        context_vec = self.c_proj(context_vec)
+        context_vec = self.dropout(context_vec)
         return context_vec
 
 # %% [markdown]
@@ -333,7 +349,10 @@ class TransformerBlock(nn.Module):
             context_len=  cfg['context_len'],
             num_heads= cfg["n_heads"],
             dropout= cfg["drop_rate"],
-            qkv_bias=cfg["qkv_bias"]
+            initializer_range=cfg['initializer_range'],
+            n_layer=cfg['n_layers'],
+            qkv_bias=cfg["qkv_bias"],
+            
         )
         self.norm2 = LayerNorm(cfg['emb_dim']) #norm2：用于前馈网络（self.ff）的输入归一化
         self.ff =FeedForward(cfg)
@@ -355,10 +374,12 @@ class TransformerBlock(nn.Module):
 
 # %%
 # ! pip install tiktoken
-
-# %%
 import tiktoken
 
+# %% [markdown]
+# ### Tokenizer
+
+# %%
 
 def text_to_tokenIds(text,tokenizer):
     encoded = tokenizer.encode(text,allowed_special={'<|endoftext|>'})
@@ -369,6 +390,76 @@ def tokenIds_to_text(token_ids,tokenizer):
     flat =token_ids.squeeze(0)
     return tokenizer.decode(flat.tolist())
 
+
+
+
+# %% [markdown]
+# ### Tokenizer with padding
+#  将文本转换为token ID张量，支持padding
+#  自回归模型采用 “自左向右” 的生成方式，注意力机制只关注当前 token 左侧的内容，推荐右填充
+
+# %%
+def texts_to_tokenIds(text, tokenizer, max_length=None, padding_side="right"):
+    """
+        text: 输入文本（单个字符串或字符串列表）
+        tokenizer: tiktoken编码器
+        max_length: 最大序列长度，超过会截断，不足会填充
+        padding_side: 填充方向（left/right）
+    """
+    if isinstance(text, str):
+        text = [text]
+    
+    # 获取特殊标记ID
+    eos_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+ 
+    pad_id = eos_id #GPT2没有专门的pad_id
+    
+    encoded_list = []
+    for t in text:
+        
+        encoded = tokenizer.encode(t, allowed_special={'<|endoftext|>'})
+        # 只在文本末尾加1个eos标记
+        if encoded and encoded[-1] != eos_id:
+            encoded.append(eos_id)
+        
+        # 截断过长序列（保留最后一个eos）
+        if max_length and len(encoded) > max_length:
+            encoded = encoded[:max_length-1] + [eos_id]  # 确保最后一个是eos
+        
+        encoded_list.append(encoded)
+    
+    # calculate maxlength
+    max_len = max_length if max_length else max(len(seq) for seq in encoded_list)
+    
+    # padding
+    padded_encoded = []
+    for seq in encoded_list:
+        pad_length = max_len - len(seq)
+        if pad_length > 0:
+            pad_tokens = [pad_id] * pad_length
+            padded_seq = seq + pad_tokens if padding_side == "right" else pad_tokens + seq
+        else:
+            padded_seq = seq
+        padded_encoded.append(padded_seq)
+    
+    return torch.tensor(padded_encoded)
+
+
+def tokenIds_to_texts(token_ids, tokenizer):
+    eos_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+    
+    if len(token_ids.shape) == 2:
+        results = []
+        for seq in token_ids:
+            flat = seq.squeeze(0).tolist()
+            flat_filtered = [id for id in flat if id != eos_id]
+            results.append(tokenizer.decode(flat_filtered))
+        return results
+    else:
+        # single text
+        flat = token_ids.squeeze(0).tolist()
+        flat_filtered = [id for id in flat if id != eos_id]
+        return tokenizer.decode(flat_filtered)
 
 # %% [markdown]
 # ## Generate text
@@ -449,8 +540,8 @@ def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
 @tool.skip_execution(skip=IS_SKIP_TEST)
 def test_tokenizer():
     model =DummyGPT(TEST_CONFIG)
-    test_context ="今天的天气是晴天，适合出去走走"
-    #test_context = "I like the weather"
+    #test_context ="今天的天气是晴天，适合出去走走"
+    test_context = "I like the weather"
     print(f'{test_context}--ori')
     tokenizer =tiktoken.get_encoding(TOKEN_TYPE)
     tokenids =text_to_tokenIds(test_context,tokenizer)
@@ -469,6 +560,30 @@ def test_tokenizer():
 test_tokenizer()
 
 
+# %%
+@tool.skip_execution(skip=IS_SKIP_TEST)
+def test_tokenizer_padding(max_len=128):
+    model =DummyGPT(TEST_CONFIG)
+    # test_context ="今天的天气是晴天，适合出去走走"
+    test_context = "I like the weather"
+    print(f'{test_context}--ori')
+    tokenizer =tiktoken.get_encoding(TOKEN_TYPE)
+    tokenids =texts_to_tokenIds(test_context,tokenizer,max_length=max_len)
+    print(f'{tokenIds_to_texts(tokenids[0],tokenizer)}--recover') 
+
+
+    tokenids_g = generate_text_greedy(model,tokenids,max_new_tokens=10,context_size=TEST_CONFIG['context_len'])
+
+    print(f'{tokenIds_to_texts(tokenids_g[0],tokenizer)}--greedy') 
+    
+    tokenids_s = generate_text_withsample(model,tokenids,max_new_tokens=10,context_size=TEST_CONFIG['context_len'],
+                                        temperature=0.5,top_k=50,top_p=1,eos_id=None)
+
+    print(f'{tokenIds_to_texts(tokenids_s[0],tokenizer)}--sample') 
+
+test_tokenizer_padding()
+
+
 # %% [markdown]
 # Epoch 过程中查看生成的文本
 # 
@@ -482,16 +597,19 @@ test_tokenizer()
 def generate_and_print(model,tokenizer,device,start_context,max_new_tokens, temperature=0,top_k=None,top_p=1,eos_id=None):
     model.eval()
     context_size = model.pos_emb.weight.shape[0]
-    encoded = text_to_tokenIds(start_context,tokenizer).to(device)
+    # print(context_size)
+    encoded = texts_to_tokenIds(start_context,tokenizer=tokenizer,max_length=context_size).to(device)
     with torch.no_grad():
         token_ids = generate_text_withsample(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size, temperature=temperature,top_k=top_k,top_p=top_p,eos_id=eos_id)
-        decoded_text = tokenIds_to_text(token_ids,tokenizer)
+        decoded_text = tokenIds_to_texts(token_ids[0],tokenizer)
     print(decoded_text.replace("\n"," "))
-    model.train()
+ 
         
 
 # %% [markdown]
 # ## GPTDataLoader
+# 
+# 预训练以长文本为主，注重上下文连续性，较少使用padding，以截断 + 滑动窗口为主
 
 # %%
 
@@ -514,7 +632,8 @@ class GPTDataset(Dataset):
                 continue
             
             # encode single text
-            tokenids = tokenizer.encode(text)
+            tokenids = tokenizer.encode(text, allowed_special={'<|endoftext|>'})
+          
             token_len= len(tokenids)
             # print('token len:',token_len)
             
@@ -645,7 +764,7 @@ def savemodel(path,model,optimizer,config):
     if False: # view model 
         for name, param in model.state_dict().items():
             print(f"{name}: {param.shape}")
-    
+            
     save_data = {"model_state_dict": model.state_dict()}
     
     if optimizer is not None:
@@ -677,7 +796,7 @@ def save_checkpoint(model, optimizer, epoch, global_step, train_losses, val_loss
         'torch_rng_state': torch.get_rng_state(),  # 保存随机数状态
         'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
     }
-    # 创建保存目录（如果不存在）
+    
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(checkpoint, save_path)
     print(f"Checkpoint saved to {save_path}")
