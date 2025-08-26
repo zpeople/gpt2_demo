@@ -3,6 +3,7 @@
 **目标**：
 * 从零实现一个GPT2架构的模型--DummyGPT, 用中文数据跑通预训练流程
 * 用HF上的GPT2来验证DummyGPT模型架构
+* 实现KV Cache
 
 ## 文件夹结构
 
@@ -44,19 +45,25 @@
   
     (如果d_out=d_model,参数量爆炸，可设置d_out=d_model/num_heads)
   * MultiHeadAttendtion_new : 参数量num_heads×d_model×head_dim, head_dim=d_model/num_head同上的d_out,比上优点只执行一次矩阵乘法 
-    
     ![att diff](./img/attn.png)
+
+  * MultiHeadAttendtion_KVCache:在上的基础上添加KV Cache
 
 * **Transformer block**:
   * 注意力分支：LayerNorm1 -> Attn -> Dropout -> 残差连接
-  *  FFN分支：LayerNorm2 -> FFN -> Dropout -> 残差连接
+  * FFN分支：LayerNorm2 -> FFN -> Dropout -> 残差连接
+* **TransformerBlock_KVCache blcok**: 添加KV Cache
 
 * **GPT DataLoader**：滑动窗口生成样本
 * **Loss Function**:  交叉熵
-* **Generate text**：
+* **Generate text**： 文本生成
   * generate_text_greedy ：贪心策略（Greedy Search）解码
   * generate_text_withsample：Top-k/Top-p采样+temperature+随机采样解码
-  
+  * generate_text_withsample_KVCache： 支持KV Cache 
+## models
+  * GPT_Model：GPT-2 框架的model
+  * GPTModel_KVCache：支持 KV Cache
+
 ## DummyGPT 训练模型
 
 匹配 GPT2 124M 参数

@@ -35,7 +35,7 @@ import math
 # %%
 
 IS_SKIP_TEST =True
-
+PAD_ID =0
 TEST_CONFIG = {
     "num_epochs":10,
     "batch_size":4,
@@ -335,6 +335,135 @@ class MultiHeadAttendtion_new(nn.Module):
         context_vec = self.dropout(context_vec)
         return context_vec
 
+# %%
+# TODO With kV cache
+
+
+class MultiHeadAttendtion_KVCache(nn.Module):
+    def __init__(self, d_in, d_out,context_len,dropout,num_heads,initializer_range,n_layer,qkv_bias=False):
+        super().__init__()
+        self.d_out =d_out
+        self.num_heads = num_heads
+        self.head_dim = d_out // num_heads
+        self.context_len =context_len
+        self.W_q = nn.Linear(d_in,d_out,bias= qkv_bias)
+        self.W_k = nn.Linear(d_in,d_out,bias= qkv_bias)
+        self.W_v = nn.Linear(d_in,d_out,bias= qkv_bias)
+        self.c_proj =nn.Linear(d_out,d_out) # out_proj 可以学习如何 “融合” 这些头的信息（例如对不同头的特征赋予不同权重），而不是简单保留原始拼接结果
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer(
+            'mask', 
+            torch.triu(torch.ones(context_len,context_len),diagonal=1)
+        )
+        self.c_proj.weight.data.normal_(
+            mean=0.0, 
+            std=initializer_range / math.sqrt(2 *n_layer)  # 层数相关的缩放
+        )
+    
+    def forward(self,x,past_kv=None,use_cache=False,attention_mask=None):
+        b,new_seq_len,d_in = x.shape
+        
+        keys = self.W_k(x)
+        queries = self.W_q(x)
+        values = self.W_v(x)
+        
+        keys = keys.view(b,new_seq_len,self.num_heads,self.head_dim)
+        queries = queries.view(b,new_seq_len,self.num_heads,self.head_dim)
+        values = values.view(b,new_seq_len,self.num_heads,self.head_dim)
+        #(b,num_tokens,num_heads,head_dim) --> (b,num_heads,num_tokens,head_dim)   
+        keys = keys.transpose(1,2)
+        queries = queries .transpose(1,2)
+        values = values.transpose(1,2)
+        
+        if attention_mask is not None:
+            # 有效token的掩码（扩展维度适配KV形状）
+            valid_mask = attention_mask.unsqueeze(1).unsqueeze(-1)  # [b, 1, new_seq_len, 1]
+            valid_mask = valid_mask.expand(-1, self.num_heads, -1, self.head_dim)  # [b, num_heads, new_seq_len, head_dim]
+            # 过滤KV中的padding部分（将padding位置的KV置为0，后续不参与计算）
+            keys = keys * valid_mask
+            values = values * valid_mask
+        
+            valid_lens = attention_mask.sum(dim=1).long()  # [b]，每个样本的有效长度
+        else:
+            # 无padding时，有效长度等于序列长度
+            valid_lens = torch.full((b,), new_seq_len, dtype=torch.long, device=x.device)
+            
+        max_keep_len = self.context_len 
+        # 处理KV缓存（首次缓存时跳过padding）
+        if past_kv is not None:
+            # 复用历史缓存：仅拼接有效部分（past_kv包含历史有效KV和长度）
+            past_keys, past_values, past_valid_lens = past_kv
+            # 计算新的总有效长度（历史有效长度 + 新有效长度）
+            total_valid_lens = past_valid_lens + valid_lens  # [b]
+
+            max_total_len = total_valid_lens.max()  # 批次内最大总有效长度（用于统一形状）
+            
+            # 初始化新的KV缓存（仅保留有效部分）
+            new_keys = torch.zeros(b, self.num_heads, max_total_len, self.head_dim, device=x.device)
+            new_values = torch.zeros_like(new_keys)
+            
+            for i in range(b):
+                # 拼接历史有效KV和新有效KV
+                past_len = past_valid_lens[i]  # 第i个样本的历史有效长度
+                curr_len = valid_lens[i]       # 第i个样本的新有效长度
+                # 复制历史有效部分
+                new_keys[i, :, :past_len, :] = past_keys[i, :, :past_len, :]
+                new_values[i, :, :past_len, :] = past_values[i, :, :past_len, :]
+                # 复制新有效部分（跳过padding）
+                new_keys[i, :, past_len:past_len+curr_len, :] = keys[i, :, :curr_len, :]
+                new_values[i, :, past_len:past_len+curr_len, :] = values[i, :, :curr_len, :]
+                
+            if max_total_len > max_keep_len:
+                # 直接截取最后max_keep_len长度的内容
+                new_keys = new_keys[:, :, -max_keep_len:, :]
+                new_values = new_values[:, :, -max_keep_len:, :]
+                # 更新有效长度（不超过max_keep_len）
+                total_valid_lens = torch.clamp(total_valid_lens, max=max_keep_len)
+                
+            keys = new_keys
+            values = new_values
+        else:
+            # 首次缓存：仅保留有效token的KV（跳过padding）
+            valid_lens = torch.minimum(valid_lens, torch.full_like(valid_lens, max_keep_len))
+            max_valid_len = valid_lens.max()  # 批次内最大有效长度
+            # 初始化缓存（仅分配有效长度的空间）
+            valid_keys = torch.zeros(b, self.num_heads, max_valid_len, self.head_dim, device=x.device)
+            valid_values = torch.zeros_like(valid_keys)
+            
+            for i in range(b):
+                # 仅存储有效token的KV（截断padding部分）
+                valid_len = valid_lens[i]
+                valid_keys[i, :, :valid_len, :] = keys[i, :, :valid_len, :]
+                valid_values[i, :, :valid_len, :] = values[i, :, :valid_len, :]
+            
+            keys = valid_keys
+            values = valid_values
+            total_valid_lens = valid_lens  # 首次缓存的总有效长度
+        
+        # 准备当前缓存（包含有效KV和有效长度，用于后续复用）
+        present_kv = (keys, values, total_valid_lens) if use_cache else None
+        total_tokens = keys.size(2)  # 总有效token数（不含padding）
+        
+        # 注意力计算（掩码处理）
+        # 因果掩码：屏蔽未来token（形状适配新序列长度和总有效长度）
+        causal_mask = self.mask[:new_seq_len, :total_tokens].bool()  # [new_seq_len, total_tokens]
+        # 扩展掩码到批次和多头维度：[b, num_heads, new_seq_len, total_tokens]
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(b, self.num_heads, -1, -1)
+        causal_mask = causal_mask.to(x.device) 
+        
+        # 计算注意力分数
+        att_score = queries @ keys.transpose(2, 3)  # [b, num_heads, new_seq_len, total_tokens]
+        
+        # 屏蔽padding和未来token
+        att_score.masked_fill_(causal_mask, -torch.inf)
+        att_weight = torch.softmax(att_score/keys.shape[-1]**0.5, dim=-1)
+    
+        context_vec = (att_weight @ values).transpose(1,2)
+        context_vec = context_vec.contiguous().view(b,new_seq_len,self.d_out)
+        context_vec = self.c_proj(context_vec)
+        context_vec = self.dropout(context_vec)
+        return context_vec, present_kv
+
 # %% [markdown]
 # ## Define Transformer block
 
@@ -365,8 +494,47 @@ class TransformerBlock(nn.Module):
         # FFN分支：LayerNorm -> FFN -> Dropout -> 残差连接
         x = x + self.dropout(self.ff(self.norm2(x)))  
         return x
+    
+
+
+
+# %% [markdown]
+# ## Define Transformer with KVCache block
+
+# %%
+class TransformerBlock_KVCache(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1 = LayerNorm(cfg['emb_dim']) #norm1：用于注意力模块（self.att）的输入归一化
+        self.att = MultiHeadAttendtion_KVCache(
+            d_in= cfg["emb_dim"],
+            d_out= cfg['emb_dim'],
+            context_len=  cfg['context_len'],
+            num_heads= cfg["n_heads"],
+            dropout= cfg["drop_rate"],
+            initializer_range=cfg['initializer_range'],
+            n_layer=cfg['n_layers'],
+            qkv_bias=cfg["qkv_bias"],
+            
+        )
+        self.norm2 = LayerNorm(cfg['emb_dim']) #norm2：用于前馈网络（self.ff）的输入归一化
+        self.ff =FeedForward(cfg)
+        self.dropout = nn.Dropout(cfg['drop_rate'])
         
-         
+    
+    def forward(self,x, past_kv=None, use_cache=False,attention_mask=None):
+        norm_x = self.norm1(x)
+        # 调用注意力模块，传入缓存并接收更新后的缓存
+        attn_output, present_kv = self.att(
+            norm_x, 
+            past_kv=past_kv,  # 传递历史缓存
+            use_cache=use_cache,  # 控制是否更新缓存
+            attention_mask=attention_mask
+        )
+        x = x + self.dropout(attn_output)  
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x, present_kv
+        
 
 # %% [markdown]
 # 
@@ -412,7 +580,7 @@ def texts_to_tokenIds(text, tokenizer, max_length=None, padding_side="right"):
     # 获取特殊标记ID
     eos_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
  
-    pad_id = eos_id #GPT2没有专门的pad_id
+    pad_id = PAD_ID #GPT2没有专门的pad_id
     
     encoded_list = []
     for t in text:
@@ -447,18 +615,20 @@ def texts_to_tokenIds(text, tokenizer, max_length=None, padding_side="right"):
 
 def tokenIds_to_texts(token_ids, tokenizer):
     eos_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+    pad_id =PAD_ID
+    filter_ids = {eos_id,pad_id}
     
     if len(token_ids.shape) == 2:
         results = []
         for seq in token_ids:
             flat = seq.squeeze(0).tolist()
-            flat_filtered = [id for id in flat if id != eos_id]
+            flat_filtered =[id for id in flat if id not in filter_ids]
             results.append(tokenizer.decode(flat_filtered))
         return results
     else:
         # single text
         flat = token_ids.squeeze(0).tolist()
-        flat_filtered = [id for id in flat if id != eos_id]
+        flat_filtered = [id for id in flat if id not in filter_ids]
         return tokenizer.decode(flat_filtered)
 
 # %% [markdown]
@@ -469,14 +639,20 @@ def tokenIds_to_texts(token_ids, tokenizer):
 # context_size: 更关注最近的上下文，只取size数量的token
 
 # %%
-
+def get_logits(logits):
+    # 检查返回值是否包含多个元素（logits和present_kvs）
+    if isinstance(logits, tuple) and len(logits) >= 1:
+        return logits[0]  
+    else:
+        return logits 
+    
 def  generate_text_greedy(model,idxs,max_new_tokens,context_size):
     model.eval()
     for _ in range(max_new_tokens):
         idx_condition = idxs[:,-context_size:]
         with torch.no_grad():
             logits = model(idx_condition)
-            
+        logits =get_logits(logits) 
         #生成时：只需要最后一个位置的 logits
         logits = logits[:,-1,:]
         probas =torch.softmax(logits,dim=-1)
@@ -485,13 +661,14 @@ def  generate_text_greedy(model,idxs,max_new_tokens,context_size):
     return idxs
 
 def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
-                              temperature=0.0,top_k=None,top_p=1,eos_id=None):
+                              temperature=0, top_k=None, top_p=1, eos_id=None):
     model.eval()
     for _ in range(max_new_tokens):
         idx_condition = idxs[:,-context_size:]
-        
+
         with torch.no_grad():
             logits = model(idx_condition)
+        logits =get_logits(logits) 
         logits = logits[:,-1,:]
         # region top k
         if top_k is not None:
@@ -533,10 +710,131 @@ def  generate_text_withsample(model,idxs,max_new_tokens,context_size,
         idxs = torch.cat((idxs,idx_next),dim=1)
     return idxs
 
+
+        
+
+# %%
+
+    
+def generate_text_withsample_KVCache(model, idxs, max_new_tokens, context_size,
+                             temperature=0, top_k=None, top_p=1, eos_id=None
+                              ):
+    model.eval()
+    past_kvs = None  
+    # print(len(idxs[0]))
+    # 初始输入处理（确保不超过最大上下文长度）
+    idx_condition = idxs[:, -context_size:]
+    batch_size, initial_seq_len = idx_condition.shape
+    
+    valid_lens = (idx_condition != PAD_ID).sum(dim=1)
+    # 取batch内最大有效长度（避免用pad_token计算初始长度）
+    initial_seq_len = valid_lens.max().item()  # 修复：用有效长度替代原始长度
+    
+    with torch.no_grad():
+        # 首次推理，获取初始logits和缓存
+        logits, past_kvs = model(idx_condition, past_kvs=None, use_cache=True)
+    logits =get_logits(logits) 
+    logits = logits[:, -1, :]  # 取最后一个token的logits
+    
+    # 存储生成的序列（包含初始输入）
+    generated_idxs = [idx_condition[:,:initial_seq_len]]
+    generated_idxs.append(torch.argmax(torch.softmax(logits, dim=-1), dim=-1, keepdim=True))
+    
+    for _ in range(max_new_tokens - 1): # 减去首次
+        # 本次输入仅使用上一步生成的token
+        idx_prev = generated_idxs[-1]
+        
+        
+        current_total_len = initial_seq_len + len(generated_idxs) - 1
+        if current_total_len >= context_size:
+            break  # 超过最大长度则停止
+        
+        with torch.no_grad():
+            # 使用KVCache进行推理，仅输入新生成的token
+            logits, past_kvs = model(
+                idx_prev, 
+                past_kvs=past_kvs, 
+                use_cache=True
+            )
+        
+        # 取最后一个token的logits（因为每次只输入一个token）
+        logits = logits[:, -1, :]
+        
+        # Top-K过滤
+        if top_k is not None:
+            top_logits, _ = torch.topk(logits, top_k)
+            min_val = top_logits[:, -1]
+            logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
+        
+        # Top-P核采样
+        if 0 < top_p < 1:
+            sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            
+            # 找到需要mask的位置
+            mask = cumulative_probs > top_p
+            # 确保至少保留一个token
+            max_mask_idx = torch.argmax(mask.float(), dim=-1, keepdim=True)
+            mask = mask.scatter(-1, max_mask_idx, False)
+            
+            sorted_logits[mask] = -torch.inf
+            # 恢复原始顺序
+            _, original_indices = torch.sort(sorted_idx, dim=-1)
+            logits = torch.gather(sorted_logits, dim=-1, index=original_indices)
+        elif top_p != 1.0:
+            raise ValueError(f"top_p must be in [0, 1], got {top_p}")
+        
+        # 应用温度并采样
+        if temperature > 0:
+            probas = torch.softmax(logits / temperature, dim=-1)
+            idx_next = torch.multinomial(probas, num_samples=1)
+        else:
+            probas = torch.softmax(logits, dim=-1)
+            idx_next = torch.argmax(probas, dim=-1, keepdim=True) 
+        
+        # 检查是否生成结束符
+        if eos_id is not None and torch.any(idx_next == eos_id):
+            generated_idxs.append(idx_next)
+            break
+        
+        generated_idxs.append(idx_next)
+    
+    # 拼接所有生成的token
+    return torch.cat(generated_idxs, dim=1)
+    
+
+# %% [markdown]
+# 
+# Epoch 过程中查看生成的文本
+# 
+# 查看模型生成的新 token 数量（max_new_tokens）:
+# * 训练监控（最常用）：20-50 个 token
+# * 轻量化验证（追求效率）：10-20 个 token
+# * 深度观察（关键节点）：50-100 个 token
+# 
+
+# %%
+
+def generate_and_print(model,tokenizer,device,start_context,max_new_tokens, temperature=0.5,top_k=None,top_p=1,eos_id=None,use_cache=False):
+    model.eval()
+    context_size = model.pos_emb.weight.shape[0]
+    encoded = texts_to_tokenIds(start_context,tokenizer=tokenizer,max_length=context_size).to(device)
+    with torch.no_grad():
+        if use_cache:
+             token_ids = generate_text_withsample_KVCache(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size, temperature=temperature,top_k=top_k,top_p=top_p,eos_id=eos_id)
+        else:
+            token_ids = generate_text_withsample(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size, temperature=temperature,top_k=top_k,top_p=top_p,eos_id=eos_id)
+        decoded_text = tokenIds_to_texts(token_ids[0],tokenizer)
+    print(decoded_text.replace("\n"," "))
+ 
+
 # %% [markdown]
 # ### test gernerate
 
 # %%
+
+
 @tool.skip_execution(skip=IS_SKIP_TEST)
 def test_tokenizer():
     model =DummyGPT(TEST_CONFIG)
@@ -556,55 +854,54 @@ def test_tokenizer():
                                         temperature=0.5,top_k=50,top_p=1,eos_id=None)
 
     print(f'{tokenIds_to_text(tokenids_s,tokenizer)}--sample') 
+    
+    
+    # tokenids_k = generate_text_withsample_KVCache(model,tokenids,max_new_tokens=10,context_size=TEST_CONFIG['context_len'],
+    #                                     temperature=0.5,top_k=50,top_p=1,eos_id=None,use_cache=True)
+
+    # print(f'{tokenIds_to_text(tokenids_k,tokenizer)}--kv cache') 
+
 
 test_tokenizer()
 
 
 # %%
+prompt ="the weather is hot"
+max_len = 20
+temperature = 0.8
+top_k = 50
 @tool.skip_execution(skip=IS_SKIP_TEST)
 def test_tokenizer_padding(max_len=128):
     model =DummyGPT(TEST_CONFIG)
+    model.eval()
+    model.to(device)
     # test_context ="今天的天气是晴天，适合出去走走"
     test_context = "I like the weather"
     print(f'{test_context}--ori')
     tokenizer =tiktoken.get_encoding(TOKEN_TYPE)
-    tokenids =texts_to_tokenIds(test_context,tokenizer,max_length=max_len)
+    tokenids =texts_to_tokenIds(test_context,tokenizer,max_length=max_len).to(device)
     print(f'{tokenIds_to_texts(tokenids[0],tokenizer)}--recover') 
 
 
-    tokenids_g = generate_text_greedy(model,tokenids,max_new_tokens=10,context_size=TEST_CONFIG['context_len'])
+    tokenids_g = generate_text_greedy(model,tokenids,max_new_tokens=max_len,context_size=TEST_CONFIG['context_len'])
 
     print(f'{tokenIds_to_texts(tokenids_g[0],tokenizer)}--greedy') 
     
-    tokenids_s = generate_text_withsample(model,tokenids,max_new_tokens=10,context_size=TEST_CONFIG['context_len'],
-                                        temperature=0.5,top_k=50,top_p=1,eos_id=None)
+    tokenids_s = generate_text_withsample(model,tokenids,max_new_tokens=max_len,context_size=TEST_CONFIG['context_len'],
+                                        temperature=temperature,top_k=top_k,top_p=1,eos_id=None)
 
     print(f'{tokenIds_to_texts(tokenids_s[0],tokenizer)}--sample') 
+    generate_and_print(model,tokenizer,device,prompt,max_new_tokens=max_len,
+                       temperature=temperature,top_k=top_k,top_p=1,eos_id=None)
 
 test_tokenizer_padding()
 
 
 # %% [markdown]
-# Epoch 过程中查看生成的文本
 # 
-# 查看模型生成的新 token 数量（max_new_tokens）:
-# * 训练监控（最常用）：20-50 个 token
-# * 轻量化验证（追求效率）：10-20 个 token
-# * 深度观察（关键节点）：50-100 个 token
 
 # %%
 
-def generate_and_print(model,tokenizer,device,start_context,max_new_tokens, temperature=0,top_k=None,top_p=1,eos_id=None):
-    model.eval()
-    context_size = model.pos_emb.weight.shape[0]
-    # print(context_size)
-    encoded = texts_to_tokenIds(start_context,tokenizer=tokenizer,max_length=context_size).to(device)
-    with torch.no_grad():
-        token_ids = generate_text_withsample(model,idxs=encoded,max_new_tokens=max_new_tokens,context_size=context_size, temperature=temperature,top_k=top_k,top_p=top_p,eos_id=eos_id)
-        decoded_text = tokenIds_to_texts(token_ids[0],tokenizer)
-    print(decoded_text.replace("\n"," "))
- 
-        
 
 # %% [markdown]
 # ## GPTDataLoader
@@ -689,12 +986,16 @@ def GPTDataloader(txts:list[str],token_type,batch_size=4,max_len=246,stride=128,
 # ## Loss funcion
 
 # %%
+
+    
 def calc_loss_batch(input_batch,target_batch,model,device):
     input_batch = input_batch.to(device)
     target_batch = target_batch.to(device)
-    logits = model(input_batch) # 隐式调用 model.forward(input_batch)
+    logits = model(input_batch)# 隐式调用 model.forward(input_batch)
+    logits = get_logits(logits) 
     loss =torch.nn.functional.cross_entropy(logits.flatten(0,1),target_batch.flatten())
     return loss
+
 
 #快速验证：指定 num_batchs=n，只跑前n个批次，节省时间。
 def calc_loss_loader(data_loader,model,device,num_batchs=None):
