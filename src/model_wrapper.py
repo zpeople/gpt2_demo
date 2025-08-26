@@ -337,7 +337,7 @@ class MultiHeadAttendtion_new(nn.Module):
 
 # %%
 # TODO With kV cache
-
+from torch.nn.functional import scaled_dot_product_attention
 
 class MultiHeadAttendtion_KVCache(nn.Module):
     def __init__(self, d_in, d_out,context_len,dropout,num_heads,initializer_range,n_layer,qkv_bias=False):
@@ -359,8 +359,8 @@ class MultiHeadAttendtion_KVCache(nn.Module):
             mean=0.0, 
             std=initializer_range / math.sqrt(2 *n_layer)  # 层数相关的缩放
         )
-    
-    def forward(self,x,past_kv=None,use_cache=False,attention_mask=None):
+    #FlashAttention 在训练和推理阶段均可使用
+    def forward(self,x,past_kv=None,use_cache=False,attention_mask=None,flash_attention=True):
         b,new_seq_len,d_in = x.shape
         
         keys = self.W_k(x)
@@ -451,15 +451,28 @@ class MultiHeadAttendtion_KVCache(nn.Module):
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(b, self.num_heads, -1, -1)
         causal_mask = causal_mask.to(x.device) 
         
-        # 计算注意力分数
-        att_score = queries @ keys.transpose(2, 3)  # [b, num_heads, new_seq_len, total_tokens]
+        if not flash_attention:
+            # 计算注意力分数
+            att_score = queries @ keys.transpose(2, 3)  # [b, num_heads, new_seq_len, total_tokens]
+            # 屏蔽padding和未来token
+            att_score.masked_fill_(causal_mask, -torch.inf)
+            att_weight = torch.softmax(att_score/keys.shape[-1]**0.5, dim=-1)
+            context_vec = (att_weight @ values)
         
-        # 屏蔽padding和未来token
-        att_score.masked_fill_(causal_mask, -torch.inf)
-        att_weight = torch.softmax(att_score/keys.shape[-1]**0.5, dim=-1)
-    
-        context_vec = (att_weight @ values).transpose(1,2)
-        context_vec = context_vec.contiguous().view(b,new_seq_len,self.d_out)
+        else:
+            # 使用FlashAttention（通过PyTorch的scaled_dot_product_attention）
+            # 该函数会自动检测并使用FlashAttention（如果硬件支持）
+            context_vec = scaled_dot_product_attention( 
+                queries, 
+                keys, 
+                values,
+                attn_mask=causal_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False  # 已手动创建因果掩码
+            )
+            
+        # transpose :[b, num_heads, new_seq_len, head_dim]-->[b, new_seq_len, num_heads, head_dim]
+        context_vec = context_vec.transpose(1, 2).contiguous().view(b, new_seq_len, self.d_out) 
         context_vec = self.c_proj(context_vec)
         context_vec = self.dropout(context_vec)
         return context_vec, present_kv
@@ -737,7 +750,7 @@ def generate_text_withsample_KVCache(model, idxs, max_new_tokens, context_size,
     logits = logits[:, -1, :]  # 取最后一个token的logits
     
     # 存储生成的序列（包含初始输入）
-    generated_idxs = [idx_condition[:,:initial_seq_len]]
+    generated_idxs = [idx_condition[:initial_seq_len]]
     generated_idxs.append(torch.argmax(torch.softmax(logits, dim=-1), dim=-1, keepdim=True))
     
     for _ in range(max_new_tokens - 1): # 减去首次

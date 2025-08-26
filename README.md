@@ -4,6 +4,7 @@
 * 从零实现一个GPT2架构的模型--DummyGPT, 用中文数据跑通预训练流程
 * 用HF上的GPT2来验证DummyGPT模型架构
 * 实现KV Cache
+* 支持flash attention
 
 ## 文件夹结构
 
