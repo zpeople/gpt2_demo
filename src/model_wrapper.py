@@ -41,12 +41,14 @@ TEST_CONFIG = {
     "batch_size":4,
     "vocab_size": 50257,     # 词汇表大小
     "context_len": 256,  # 上下文长度
-    "emb_dim": 512,          # 嵌入维度
+    "emb_dim": 512,      # 嵌入维度 d_model
     "n_heads": 8,           # 注意力头的数量
     "n_layers": 12,          # 层数
     "drop_rate": 0.1,        # dropout率
     "initializer_range":0.02,
     "qkv_bias": False ,      # 查询-键-值偏置
+    "num_experts":8,
+    "expert_top_k":2,
 }
 
 TOKEN_TYPE="gpt2"
@@ -172,6 +174,10 @@ test_layer_norm()
 # 
 # 高斯误差线性单元 GELU
 # Φ(x) ≈ 0.5 * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+# 
+# 
+# 
+# softplus(x) = ln(1 + exp(x)) 相比 ReLU 不会出现神经元 "死亡" 问题, 可以作为 ReLU 的替代函数，用于需要平滑激活函数的场景
 
 # %%
 class GELU(nn.Module):
@@ -186,6 +192,18 @@ class GELU(nn.Module):
                       )
         
 
+class Soft_plus(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+      
+    def forward(self,x):
+        """
+        数值稳定版 softplus 实现
+        避免 x 很大时 exp(x) 导致的数值溢出
+        """
+        # 对于 x > 0，使用 x + ln(1 + exp(-x)) 等价形式
+        # 对于 x <= 0，使用 ln(1 + exp(x))
+        return torch.where(x > 0, x + torch.log(1 + torch.exp(-x)), torch.log(1 + torch.exp(x))) 
 
 # %% [markdown]
 # ### test gelu
@@ -226,7 +244,7 @@ class FeedForward(nn.Module):
         super().__init__()
     
         #中间层hidden_dim通常设为4*emb_dim（如原始 Transformer 中为 512→2048→512），通过扩展维度捕捉更丰富的特征
-        self.c_fc=nn.Linear(cfg['emb_dim'],4*cfg['emb_dim'])
+        self.c_fc= nn.Linear(cfg['emb_dim'],4*cfg['emb_dim'])
         self.act=   GELU()
         self.dropout=   nn.Dropout(cfg['drop_rate'])
         self.c_proj=  nn.Linear(4*cfg['emb_dim'],cfg['emb_dim'])
@@ -241,6 +259,111 @@ class FeedForward(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+
+# %% [markdown]
+# ## Define MOE
+# 
+
+# %%
+# Expert model
+class Expert(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cfg['emb_dim'],4*cfg['emb_dim']),
+            GELU(),
+            nn.Linear(4 * cfg['emb_dim'], cfg['emb_dim']),
+            nn.Dropout(cfg['drop_rate']),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+    
+# TopK router
+class TopkRouter(nn.Module):
+    def __init__(self, n_embed, num_experts, top_k):
+        super().__init__()
+        self.top_k = top_k
+        self.linear =nn.Linear(n_embed, num_experts)
+    
+    def forward(self, x):
+        logits = self.linear(x)    # （Batch size，Tokens，n_embed）->（Batch size，Tokens，num_experts）
+        top_k_logits, indices = logits.topk(self.top_k, dim=-1)
+        zeros = torch.full_like(logits, float('-inf'))
+        # 按照索引和值填充上述zeros矩阵
+        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
+        router_output = torch.softmax(sparse_logits, dim=-1)
+        return router_output, indices
+    
+# Update to  Noisy TopK router
+class NoisyTopkRouter(nn.Module):
+    def __init__(self, n_embed, num_experts, top_k):
+        super().__init__()
+        self.top_k = top_k
+        self.topkroute_linear = nn.Linear(n_embed, num_experts)
+        # add noise
+        self.noise_linear =nn.Linear(n_embed, num_experts)
+        self.soft_plus = Soft_plus()
+
+    
+    def forward(self, x):
+        # x is the output tensor from multihead self attention block
+        logits = self.topkroute_linear(x)
+
+        # Noise logits
+        noise_logits = self.noise_linear(x)
+
+        # Adding scaled unit gaussian noise to the logits
+        noise = torch.randn_like(logits)* self.soft_plus(noise_logits) #非负且0可导 安全地转换为正的噪声标准差
+        noisy_logits = logits + noise
+
+        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)# indices：选中的专家索引 [batch_size, seq_len, top_k]
+        zeros = torch.full_like(noisy_logits, float('-inf'))
+        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
+        router_output = torch.softmax(sparse_logits, dim=-1)
+        return router_output, indices
+    
+# Sparse MOE
+class SparseMoE(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        
+        self.top_k = cfg['expert_top_k']
+        self.router = NoisyTopkRouter(cfg['emb_dim'], cfg['num_experts'], cfg['expert_top_k']) #选择分数最高的top_k个专家，分配给这个 token
+        self.experts = nn.ModuleList(
+            [Expert(cfg) for _ in range( cfg['num_experts'])] # num_experts 个专家
+                                     )
+
+    def forward(self, x):
+        #gating_output：门控权重，形状为[batch_size, seq_len, num_experts]，只有Top_k个专家权重非零
+        gating_output, indices = self.router(x) 
+        # initial output
+        final_output = torch.zeros_like(x)
+
+        #Flattening 
+        flat_x = x.view(-1, x.size(-1)) #[batch, seq_len, n_embed]-->[batch*seq_len, n_embed]
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+
+        # 以每个专家为单位进行操作，即把当前专家处理的所有token都进行加权
+        for i, expert in enumerate(self.experts):
+            #.any() 是逻辑 “或” 操作
+            expert_mask = (indices == i).any(dim=-1) #[batch_size, seq_len] 大小的token 的所有Topk里面有没有符合i的专家，合并Topk，值为True or False
+            flat_mask = expert_mask.view(-1)# 当前专家 i 的掩码展平为[batch*seq_len]，标记需要当前专家处理的token
+        
+            if flat_mask.any(): #当前专家i 至少有一个要处理的 token
+                expert_input = flat_x[flat_mask]  # filter token [num_tokens,n_embed]
+                expert_output = expert(expert_input) #专家处理 本质是FFN
+                # 获取这些token对应专家i的门控权重
+                gating_scores = flat_gating_output[flat_mask, i].unsqueeze(1)#[num_tokens, 1]
+
+                weighted_output = expert_output * gating_scores
+
+                # 每个token的输出是其选中的top_k个专家的加权和
+                final_output[expert_mask] += weighted_output.squeeze(1)
+
+        return final_output
+
+    
 
 # %% [markdown]
 # ## Define MultiAttention
@@ -502,6 +625,7 @@ class TransformerBlock(nn.Module):
         
     
     def forward(self,x):
+        # Pre-Layernorm 稳定性
         # 注意力分支：LayerNorm -> 注意力 -> Dropout -> 残差连接
         x = x + self.dropout(self.att(self.norm1(x))) 
         # FFN分支：LayerNorm -> FFN -> Dropout -> 残差连接
@@ -512,7 +636,7 @@ class TransformerBlock(nn.Module):
 
 
 # %% [markdown]
-# ## Define Transformer with KVCache block
+# ## Define Transformer  block with KVCache 
 
 # %%
 class TransformerBlock_KVCache(nn.Module):
@@ -546,6 +670,44 @@ class TransformerBlock_KVCache(nn.Module):
         )
         x = x + self.dropout(attn_output)  
         x = x + self.dropout(self.ff(self.norm2(x)))
+        return x, present_kv
+        
+
+# %% [markdown]
+# ## Define MOE Transformer block  with KVCache 
+
+# %%
+class TransformerBlock_MOE_KVCache(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.norm1 = LayerNorm(cfg['emb_dim']) #norm1
+        self.att = MultiHeadAttendtion_KVCache(
+            d_in= cfg["emb_dim"],
+            d_out= cfg['emb_dim'],
+            context_len=  cfg['context_len'],
+            num_heads= cfg["n_heads"],
+            dropout= cfg["drop_rate"],
+            initializer_range=cfg['initializer_range'],
+            n_layer=cfg['n_layers'],
+            qkv_bias=cfg["qkv_bias"],
+            
+        )
+        self.norm2 = LayerNorm(cfg['emb_dim']) #norm2
+        self.moe =SparseMoE(cfg)
+        self.dropout = nn.Dropout(cfg['drop_rate'])
+        
+    
+    def forward(self,x, past_kv=None, use_cache=False,attention_mask=None):
+        norm_x = self.norm1(x)
+        # 调用注意力模块，传入缓存并接收更新后的缓存
+        attn_output, present_kv = self.att(
+            norm_x, 
+            past_kv=past_kv,  # 传递历史缓存
+            use_cache=use_cache,  # 控制是否更新缓存
+            attention_mask=attention_mask
+        )
+        x = x + self.dropout(attn_output)  
+        x = x + self.dropout(self.moe(self.norm2(x)))
         return x, present_kv
         
 
@@ -912,9 +1074,6 @@ test_tokenizer_padding()
 
 # %% [markdown]
 # 
-
-# %%
-
 
 # %% [markdown]
 # ## GPTDataLoader
