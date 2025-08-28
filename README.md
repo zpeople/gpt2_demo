@@ -16,6 +16,7 @@
     │   │   └── interactive_generate.py     # 命令行交互模型
     │   ├── log                             # tensorboard 日志
     │   ├── model                           # 存储训练好的模型
+    │   ├── test                            # 测试代码
     │   ├── src
     │   │   ├── DummyGPT_with_weight.ipynb  # 复用OpenAI gpt2 weights，对比校验
     │   │   ├── DummyGPT.ipynb              # 模型训练
